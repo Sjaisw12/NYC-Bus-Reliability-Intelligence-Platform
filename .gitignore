@@ -1,0 +1,44 @@
+# Local credentials; the empty example stays reviewable.
+.env
+.env.*
+!.env.example
+**/secrets/
+**/credentials/
+credentials*.json
+*credentials*.json
+*.pem
+*.key
+*.p12
+*.pfx
+.netrc
+.npmrc
+.aws/
+
+# Collector outputs, including interrupted and custom output bundles anywhere.
+data/
+**/poll-*/
+**/.tmp-*/
+response.bin
+metadata.json
+accepted.jsonl
+quarantine.jsonl
+reports/
+output/
+artifacts/
+*.log
+*.tmp
+*.temp
+*.zip
+*.tar
+*.tar.gz
+
+# Python/build caches.
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+build/
+dist/
+.pytest_cache/
+
+# Sanitized docs and tests/fixtures/*.json remain visible.

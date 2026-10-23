@@ -1,0 +1,6 @@
+# Candidate only: requires current GTFS + authenticated LineRef verification.
+route = "MTA NYCT_B63"
+live_enabled = false
+max_attempts = 3
+timeout_seconds = 15
+# Phase 0 CLI performs a single poll, never a continuous loop.
