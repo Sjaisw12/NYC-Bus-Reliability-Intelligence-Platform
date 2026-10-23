@@ -80,19 +80,27 @@ logs/archives, reports/output/artifacts, poll directories, derived filenames, an
 Sanitized documentation, .env.example, and synthetic JSON fixtures remain visible.
 Never force-add ignored output or put credentials in arbitrary source filenames.
 
-The network secret variable is opaque and may contain only a placeholder. Query
-construction preserves URL-safe characters byte-for-byte and encodes other request
-parameters separately. Unexpected placeholder formats (percent signs, spaces,
-reserved delimiters, control/non-ASCII characters) fail before transport with a
-value-free configuration error. No attempt is made to retrieve the raw key or
-perform local signing. Inherited HTTPS proxy/TLS trust and redirect refusal remain.
-Mocked tests verify the exact outgoing synthetic value without using the actual
-variable. No real placeholder was inspected and no authenticated request was made.
+The network secret variable is opaque and may contain only a placeholder. The entire
+fixed parameter mapping, including the credential as one `key` value, is encoded
+with standard-library `urlencode(..., quote_via=quote, safe="")`. Reserved
+characters, percent signs, spaces, and Unicode round-trip as value data; they cannot
+add parameters or change the fixed version, B63 LineRef, or detail level. Empty
+values, C0/C1 controls and DEL, and unpaired Unicode surrogates fail before
+transport with value-free errors. Surrogates are rejected because they cannot be
+encoded as valid UTF-8. No decoding, normalization, or local substitution occurs.
+Inherited HTTPS proxy/TLS trust, redirect refusal, live authorization gates,
+15-second timeout, and bounded retries remain unchanged. Raw and percent-encoded
+local credential echoes are rejected before persistence; credential-field/UUID
+checks remain conservative safeguards for unknown substituted values.
 
-Actual Codex query substitution remains an environment integration check: the
-future authorized smoke test must confirm that this fail-closed policy accepts
-the injected format and that the proxy substitutes query values for the exact
-allowed HTTPS host. Do not weaken the check or move the real key into a local
-variable to bypass a compatibility failure. Provider echo detection is conservative,
-not a proof that every arbitrary source body is safe to publish. Public/raw release
-still requires independent review.
+On 2026-10-23, one separately authorized disposable synthetic credential experiment
+returned HTTP 200 and verified percent-encoded placeholder substitution and query
+parameter isolation through this environment's proxy. No actual MTA request was
+made. This proves behavior only for that disposable credential in that environment;
+it does not establish universal proxy behavior or handling of arbitrary real
+credential values. The implementation tests use synthetic credentials and mocked
+transport only. No real MTA credential or its placeholder was accessed for this
+correction. Provider echo detection cannot recognize every possible encoding or
+secret format; raw data remains private and ignored. Public/raw release still
+requires independent review. An authenticated MTA smoke test remains a separate
+authorization and review gate.

@@ -1,5 +1,6 @@
 """Focused regression coverage; all credentials and responses are synthetic."""
 import contextlib
+from email.message import Message
 import hashlib
 import io
 import json
@@ -10,10 +11,13 @@ import subprocess
 import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
+from urllib.error import HTTPError
+from urllib.parse import parse_qsl, quote, urlsplit
+from urllib.request import ProxyHandler, build_opener
 
 from mta_collector import cli
 from mta_collector.core import (DATA_ROOT, ENDPOINT, LiveTransport, Response, Store,
-                                collect, credential_query)
+                                NoRedirect, collect, credential_query, redact)
 
 NOW = "2026-10-22T12:00:00Z"
 BODY = (Path(__file__).parent / "fixtures/vehicle.json").read_bytes()
@@ -125,16 +129,109 @@ class CorrectionTests(unittest.TestCase):
         request = opener.open.call_args.args[0]
         self.assertTrue(request.full_url.startswith(ENDPOINT + "?"))
         self.assertTrue(request.full_url.endswith("&key=" + token))
-        self.assertIn("LineRef=MTA+NYCT_B63", request.full_url)
+        self.assertIn("LineRef=MTA%20NYCT_B63", request.full_url)
         self.assertEqual(opener.open.call_args.kwargs["timeout"], 15)
 
-    def test_unsupported_placeholder_fails_closed_without_value_in_error(self):
-        for token in ("SYNTHETIC<TOKEN>", "SYNTHETIC&TOKEN", "SYNTHETIC%TOKEN", "SYNTHETIC TOKEN", "SYNTHETIC\nTOKEN"):
-            with self.subTest(token=token), patch.dict(os.environ, {"MTA_BUSTIME_API_KEY": token}), patch("mta_collector.core.build_opener") as build:
+    def test_query_encoding_round_trips_and_isolates_fixed_parameters(self):
+        for token in ("SYNTHETIC<TOKEN>", "%", "%26key%3Dother", "+", "&", "?", "#",
+                      " ", "SYNTHETIC café 雪", "version=3&LineRef=OTHER&VehicleMonitoringDetailLevel=calls&key=other#fragment"):
+            with self.subTest(token=token):
+                query = credential_query(token)
+                parts = urlsplit(ENDPOINT + "?" + query)
+                self.assertEqual(parts.fragment, "")
+                self.assertNotIn("+", query)
+                self.assertNotIn(" ", query)
+                pairs = parse_qsl(parts.query, keep_blank_values=True, strict_parsing=True)
+                self.assertEqual(pairs, [("version", "2"), ("LineRef", "MTA NYCT_B63"),
+                                        ("VehicleMonitoringDetailLevel", "normal"), ("key", token)])
+                self.assertTrue(query.endswith("&key=" + quote(token, safe="")))
+
+    def test_empty_controls_and_surrogates_fail_closed_without_value_in_error(self):
+        tokens = [""] + ["SYNTHETIC" + chr(c) + "TOKEN" for c in
+                          [*range(32), *range(127, 160), 0xD800, 0xDFFF]]
+        for token in tokens:
+            with self.subTest(token=token), patch("mta_collector.core.os.environ", {"MTA_BUSTIME_API_KEY": token}), patch("mta_collector.core.build_opener") as build:
+                with self.assertRaisesRegex(ValueError, "^credential is empty or contains unsupported characters$"):
+                    credential_query(token)
                 with self.assertRaises(ValueError) as exc:
                     LiveTransport(enabled=True)
-                self.assertNotIn(token, str(exc.exception))
+                self.assertIn(str(exc.exception), ("MTA_BUSTIME_API_KEY is required",
+                                                  "credential is empty or contains unsupported characters"))
                 build.assert_not_called()
+
+    def test_encoded_synthetic_value_in_mock_request_preserves_transport_policy(self):
+        token = "SYNTHETIC%+&?# café"
+        opener = MagicMock()
+        response = opener.open.return_value.__enter__.return_value
+        response.status, response.read.return_value = 200, BODY
+        with patch.dict(os.environ, {"MTA_BUSTIME_API_KEY": token}), patch("mta_collector.core.build_opener", return_value=opener) as build:
+            transport = LiveTransport(enabled=True)
+            self.assertEqual(transport(), Response(200, BODY, response.headers.get("Retry-After")))
+        handlers = build.call_args.args
+        self.assertEqual(len(handlers), 2)
+        self.assertIsInstance(handlers[0], ProxyHandler)
+        self.assertIsInstance(handlers[1], NoRedirect)
+        opener.open.assert_called_once()
+        request = opener.open.call_args.args[0]
+        self.assertEqual(request.get_method(), "GET")
+        self.assertEqual(request.full_url, ENDPOINT + "?" + credential_query(token))
+        self.assertEqual(opener.open.call_args.kwargs, {"timeout": 15})
+
+    def test_redirects_refused_without_second_request(self):
+        # Exercise urllib's redirect handling offline, including the Location header.
+        redirect = NoRedirect()
+        opener = build_opener(ProxyHandler({}), redirect)
+        token = "SYNTHETIC&?#"
+        with patch.dict(os.environ, {"MTA_BUSTIME_API_KEY": token}), patch("mta_collector.core.build_opener", return_value=opener):
+            transport = LiveTransport(enabled=True)
+        for status in (301, 302, 303, 307, 308):
+            with self.subTest(status=status):
+                def redirected(request, **kwargs):
+                    headers = Message()
+                    headers["Location"] = "https://example.invalid/redirect"
+                    return opener.error("https", request, io.BytesIO(), status, "redirect", headers)
+                with patch.object(opener, "open", side_effect=redirected) as opened:
+                    self.assertEqual(transport().status, status)
+                    opened.assert_called_once()
+
+    def test_raw_and_encoded_credential_echoes_rejected_and_redacted(self):
+        token = "SYNTHETIC%+&?# café"
+        for echo in (token, quote(token, safe="")):
+            with self.subTest(echo=echo):
+                self.assertEqual(redact("echo " + echo, token), "echo [REDACTED]")
+                raw = self.collect(body=json.dumps({"echo": echo}, ensure_ascii=False).encode(), secret=token)[0]
+                self.assertEqual((raw / "response.bin").read_bytes(), b"")
+                self.assertEqual(json.loads((raw / "metadata.json").read_text())["error"], "unsafe_credential_echo")
+        for file in self.store.root.rglob("*"):
+            if file.is_file():
+                self.assertNotIn(token.encode(), file.read_bytes())
+                self.assertNotIn(quote(token, safe="").encode(), file.read_bytes())
+
+    def test_credential_urls_never_exposed_by_transport_errors_or_logs(self):
+        token = "SYNTHETIC%+&?# café"
+        url = ENDPOINT + "?" + credential_query(token)
+        for failure in (OSError(url), HTTPError(url, 403, url, {}, None)):
+            opener = MagicMock()
+            opener.open.side_effect = failure
+            with patch.dict(os.environ, {"MTA_BUSTIME_API_KEY": token}), patch("mta_collector.core.build_opener", return_value=opener):
+                transport = LiveTransport(enabled=True)
+            with contextlib.redirect_stdout(io.StringIO()) as stdout, contextlib.redirect_stderr(io.StringIO()) as stderr, patch("logging.Logger._log") as log:
+                if isinstance(failure, HTTPError):
+                    self.assertEqual(transport(), Response(403, b""))
+                else:
+                    with self.assertRaises(OSError) as exc:
+                        transport()
+                    self.assertEqual(str(exc.exception), "transport failure")
+                    self.assertTrue(exc.exception.__suppress_context__)
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertEqual(stderr.getvalue(), "")
+                log.assert_not_called()
+
+    def test_disabled_live_mode_does_not_read_credential(self):
+        with patch("mta_collector.core.os.environ.get", side_effect=AssertionError("must not read environment")), patch("mta_collector.core.build_opener") as build:
+            with self.assertRaisesRegex(ValueError, "explicit authorization required"):
+                LiveTransport()
+            build.assert_not_called()
 
     def test_transport_errors_never_persist_synthetic_placeholder(self):
         token = "SYNTHETIC_PLACEHOLDER"

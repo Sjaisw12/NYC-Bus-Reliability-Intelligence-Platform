@@ -38,12 +38,13 @@ def storage_path(root: Path) -> Path:
 
 
 def credential_query(credential: str) -> str:
-    # Preserve the opaque placeholder byte-for-byte: never percent-encode it.
-    # Unknown placeholder formats fail closed rather than guessing proxy behavior.
-    if not re.fullmatch(r"[A-Za-z0-9._~-]+", credential):
-        raise ValueError("credential placeholder is not URL-safe; proxy compatibility unverified")
+    # Encode the opaque value once, together with all fixed query parameters.
+    # Reject controls and unpaired surrogates before URL construction.
+    if not credential or re.search(r"[\x00-\x1f\x7f-\x9f\ud800-\udfff]", credential):
+        raise ValueError("credential is empty or contains unsupported characters")
     return urlencode({"version": 2, "LineRef": ROUTE,
-                      "VehicleMonitoringDetailLevel": "normal"}) + "&key=" + credential
+                      "VehicleMonitoringDetailLevel": "normal", "key": credential},
+                     quote_via=quote, safe="")
 
 
 ROUTE = "MTA NYCT_B63"  # Candidate, not a verified current identifier.
